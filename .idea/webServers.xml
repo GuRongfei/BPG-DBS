@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="b94ac690-9f78-46b7-b7df-92ece38ab9d4" name="BPG-DBS">
+        <fileTransfer rootFolder="/userhome/gurongfei/grf/BPG-DBS" accessType="SFTP" host="202.120.38.167" port="30203" sshConfigId="c0e2670c-8a23-4cdb-8d0f-29a143f171c8" sshConfig="gurongfei@202.120.38.167:30203 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>
