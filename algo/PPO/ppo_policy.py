@@ -224,11 +224,7 @@ class ActorCriticPolicy(BasePolicy):
         self._policy = None
         self._proba_distribution = None
         self._value_fn = None
-        self._q_value = None
-        self._q_flat = None
-        self._grad_q = None
         self._action = None
-        self._cast_action = None
         self._deterministic_action = None
 
     def _setup_init(self):
@@ -236,13 +232,6 @@ class ActorCriticPolicy(BasePolicy):
         with tf.variable_scope("output", reuse=True):
             assert self.policy is not None and self.proba_distribution is not None and self.value_fn is not None
             self._action = self.proba_distribution.sample()
-            act_len = self.action.get_shape()[-1].value
-            if not act_len:
-                act_len = 1
-                self._cast_action = tf.one_hot(self._action, 2)
-            else:
-                self._cast_action = tf.cast(self._action, dtype=tf.float32)
-                self._cast_action = tf.reshape(self._cast_action, [-1, act_len])
             self._deterministic_action = self.proba_distribution.mode()
             self._neglogp = self.proba_distribution.neglogp(self.action)
             if isinstance(self.proba_distribution, CategoricalProbabilityDistribution):
@@ -284,25 +273,9 @@ class ActorCriticPolicy(BasePolicy):
         return self._value_flat
 
     @property
-    def q_value(self):
-        return self._q_value
-
-    @property
-    def q_flat(self):
-        return self._q_flat
-
-    @property
-    def grad_q(self):
-        return self._grad_q
-
-    @property
     def action(self):
         """tf.Tensor: stochastic action, of shape (self.n_batch, ) + self.ac_space.shape."""
         return self._action
-
-    @property
-    def cast_action(self):
-        return self._cast_action
 
     @property
     def deterministic_action(self):
@@ -343,6 +316,202 @@ class ActorCriticPolicy(BasePolicy):
         :return: ([float]) The associated value of the action
         """
         raise NotImplementedError
+
+
+class RecurrentActorCriticPolicy(ActorCriticPolicy):
+    """
+    Actor critic policy object uses a previous state in the computation for the current step.
+    NOTE: this class is not limited to recurrent neural network policies,
+    see https://github.com/hill-a/stable-baselines/issues/241
+
+    :param sess: (TensorFlow session) The current TensorFlow session
+    :param ob_space: (Gym Space) The observation space of the environment
+    :param ac_space: (Gym Space) The action space of the environment
+    :param n_env: (int) The number of environments to run
+    :param n_steps: (int) The number of steps to run for each environment
+    :param n_batch: (int) The number of batch to run (n_envs * n_steps)
+    :param state_shape: (tuple<int>) shape of the per-environment state space.
+    :param reuse: (bool) If the policy is reusable or not
+    :param scale: (bool) whether or not to scale the input
+    """
+
+    recurrent = True
+
+    def __init__(self, sess, ob_space, ac_space, n_env, n_steps, n_batch,
+                 state_shape, reuse=False, scale=False):
+        super(RecurrentActorCriticPolicy, self).__init__(sess, ob_space, ac_space, n_env, n_steps,
+                                                         n_batch, reuse=reuse, scale=scale)
+
+        with tf.variable_scope("input", reuse=False):
+            self._dones_ph = tf.placeholder(tf.float32, (n_batch, ), name="dones_ph")  # (done t-1)
+            state_ph_shape = (self.n_env, ) + tuple(state_shape)
+            self._states_ph = tf.placeholder(tf.float32, state_ph_shape, name="states_ph")
+
+        initial_state_shape = (self.n_env, ) + tuple(state_shape)
+        self._initial_state = np.zeros(initial_state_shape, dtype=np.float32)
+
+    @property
+    def initial_state(self):
+        return self._initial_state
+
+    @property
+    def dones_ph(self):
+        """tf.Tensor: placeholder for whether episode has terminated (done), shape (self.n_batch, ).
+        Internally used to reset the state before the next episode starts."""
+        return self._dones_ph
+
+    @property
+    def states_ph(self):
+        """tf.Tensor: placeholder for states, shape (self.n_env, ) + state_shape."""
+        return self._states_ph
+
+    @abstractmethod
+    def value(self, obs, state=None, mask=None):
+        """
+        Cf base class doc.
+        """
+        raise NotImplementedError
+
+
+class LstmPolicy(RecurrentActorCriticPolicy):
+    """
+    Policy object that implements actor critic, using LSTMs.
+
+    :param sess: (TensorFlow session) The current TensorFlow session
+    :param ob_space: (Gym Space) The observation space of the environment
+    :param ac_space: (Gym Space) The action space of the environment
+    :param n_env: (int) The number of environments to run
+    :param n_steps: (int) The number of steps to run for each environment
+    :param n_batch: (int) The number of batch to run (n_envs * n_steps)
+    :param n_lstm: (int) The number of LSTM cells (for recurrent policies)
+    :param reuse: (bool) If the policy is reusable or not
+    :param layers: ([int]) The size of the Neural network before the LSTM layer  (if None, default to [64, 64])
+    :param net_arch: (list) Specification of the actor-critic policy network architecture. Notation similar to the
+        format described in mlp_extractor but with additional support for a 'lstm' entry in the shared network part.
+    :param act_fun: (tf.func) the activation function to use in the neural network.
+    :param cnn_extractor: (function (TensorFlow Tensor, ``**kwargs``): (TensorFlow Tensor)) the CNN feature extraction
+    :param layer_norm: (bool) Whether or not to use layer normalizing LSTMs
+    :param feature_extraction: (str) The feature extraction type ("cnn" or "mlp")
+    :param kwargs: (dict) Extra keyword arguments for the nature CNN feature extraction
+    """
+
+    recurrent = True
+
+    def __init__(self, sess, ob_space, ac_space, n_env, n_steps, n_batch, n_lstm=256, reuse=False, layers=None,
+                 net_arch=None, act_fun=tf.tanh, cnn_extractor=nature_cnn, layer_norm=False, feature_extraction="cnn",
+                 **kwargs):
+        # state_shape = [n_lstm * 2] dim because of the cell and hidden states of the LSTM
+        super(LstmPolicy, self).__init__(sess, ob_space, ac_space, n_env, n_steps, n_batch,
+                                         state_shape=(2 * n_lstm, ), reuse=reuse,
+                                         scale=(feature_extraction == "cnn"))
+
+        self._kwargs_check(feature_extraction, kwargs)
+
+        if net_arch is None:  # Legacy mode
+            if layers is None:
+                layers = [64, 64]
+            else:
+                warnings.warn("The layers parameter is deprecated. Use the net_arch parameter instead.")
+
+            with tf.variable_scope("model", reuse=reuse):
+                if feature_extraction == "cnn":
+                    extracted_features = cnn_extractor(self.processed_obs, **kwargs)
+                else:
+                    extracted_features = tf.layers.flatten(self.processed_obs)
+                    for i, layer_size in enumerate(layers):
+                        extracted_features = act_fun(linear(extracted_features, 'pi_fc' + str(i), n_hidden=layer_size,
+                                                            init_scale=np.sqrt(2)))
+                input_sequence = batch_to_seq(extracted_features, self.n_env, n_steps)
+                masks = batch_to_seq(self.dones_ph, self.n_env, n_steps)
+                rnn_output, self.snew = lstm(input_sequence, masks, self.states_ph, 'lstm1', n_hidden=n_lstm,
+                                             layer_norm=layer_norm)
+                rnn_output = seq_to_batch(rnn_output)
+                value_fn = linear(rnn_output, 'vf', 1)
+
+                self._proba_distribution, self._policy, self.q_value = \
+                    self.pdtype.proba_distribution_from_latent(rnn_output, rnn_output)
+
+            self._value_fn = value_fn
+        else:  # Use the new net_arch parameter
+            if layers is not None:
+                warnings.warn("The new net_arch parameter overrides the deprecated layers parameter.")
+            if feature_extraction == "cnn":
+                raise NotImplementedError()
+
+            with tf.variable_scope("model", reuse=reuse):
+                latent = tf.layers.flatten(self.processed_obs)
+                policy_only_layers = []  # Layer sizes of the network that only belongs to the policy network
+                value_only_layers = []  # Layer sizes of the network that only belongs to the value network
+
+                # Iterate through the shared layers and build the shared parts of the network
+                lstm_layer_constructed = False
+                for idx, layer in enumerate(net_arch):
+                    if isinstance(layer, int):  # Check that this is a shared layer
+                        layer_size = layer
+                        latent = act_fun(linear(latent, "shared_fc{}".format(idx), layer_size, init_scale=np.sqrt(2)))
+                    elif layer == "lstm":
+                        if lstm_layer_constructed:
+                            raise ValueError("The net_arch parameter must only contain one occurrence of 'lstm'!")
+                        input_sequence = batch_to_seq(latent, self.n_env, n_steps)
+                        masks = batch_to_seq(self.dones_ph, self.n_env, n_steps)
+                        rnn_output, self.snew = lstm(input_sequence, masks, self.states_ph, 'lstm1', n_hidden=n_lstm,
+                                                     layer_norm=layer_norm)
+                        latent = seq_to_batch(rnn_output)
+                        lstm_layer_constructed = True
+                    else:
+                        assert isinstance(layer, dict), "Error: the net_arch list can only contain ints and dicts"
+                        if 'pi' in layer:
+                            assert isinstance(layer['pi'],
+                                              list), "Error: net_arch[-1]['pi'] must contain a list of integers."
+                            policy_only_layers = layer['pi']
+
+                        if 'vf' in layer:
+                            assert isinstance(layer['vf'],
+                                              list), "Error: net_arch[-1]['vf'] must contain a list of integers."
+                            value_only_layers = layer['vf']
+                        break  # From here on the network splits up in policy and value network
+
+                # Build the non-shared part of the policy-network
+                latent_policy = latent
+                for idx, pi_layer_size in enumerate(policy_only_layers):
+                    if pi_layer_size == "lstm":
+                        raise NotImplementedError("LSTMs are only supported in the shared part of the policy network.")
+                    assert isinstance(pi_layer_size, int), "Error: net_arch[-1]['pi'] must only contain integers."
+                    latent_policy = act_fun(
+                        linear(latent_policy, "pi_fc{}".format(idx), pi_layer_size, init_scale=np.sqrt(2)))
+
+                # Build the non-shared part of the value-network
+                latent_value = latent
+                for idx, vf_layer_size in enumerate(value_only_layers):
+                    if vf_layer_size == "lstm":
+                        raise NotImplementedError("LSTMs are only supported in the shared part of the value function "
+                                                  "network.")
+                    assert isinstance(vf_layer_size, int), "Error: net_arch[-1]['vf'] must only contain integers."
+                    latent_value = act_fun(
+                        linear(latent_value, "vf_fc{}".format(idx), vf_layer_size, init_scale=np.sqrt(2)))
+
+                if not lstm_layer_constructed:
+                    raise ValueError("The net_arch parameter must contain at least one occurrence of 'lstm'!")
+
+                self._value_fn = linear(latent_value, 'vf', 1)
+                # TODO: why not init_scale = 0.001 here like in the feedforward
+                self._proba_distribution, self._policy, self.q_value = \
+                    self.pdtype.proba_distribution_from_latent(latent_policy, latent_value)
+        self._setup_init()
+
+    def step(self, obs, state=None, mask=None, deterministic=False):
+        if deterministic:
+            return self.sess.run([self.deterministic_action, self.value_flat, self.snew, self.neglogp],
+                                 {self.obs_ph: obs, self.states_ph: state, self.dones_ph: mask})
+        else:
+            return self.sess.run([self.action, self.value_flat, self.snew, self.neglogp],
+                                 {self.obs_ph: obs, self.states_ph: state, self.dones_ph: mask})
+
+    def proba_step(self, obs, state=None, mask=None):
+        return self.sess.run(self.policy_proba, {self.obs_ph: obs, self.states_ph: state, self.dones_ph: mask})
+
+    def value(self, obs, state=None, mask=None):
+        return self.sess.run(self.value_flat, {self.obs_ph: obs, self.states_ph: state, self.dones_ph: mask})
 
 
 class FeedForwardPolicy(ActorCriticPolicy):
@@ -393,64 +562,84 @@ class FeedForwardPolicy(ActorCriticPolicy):
 
             self._value_fn = linear(vf_latent, 'vf', 1)
 
-            self._proba_distribution, self._policy, _ = \
+            self._proba_distribution, self._policy, self.q_value = \
                 self.pdtype.proba_distribution_from_latent(pi_latent, vf_latent, init_scale=0.01)
 
-            """mean = tf.tanh(linear(pi_latent, 'pi', self.pdtype.size))
-            logstd = tf.get_variable(name='pi/logstd', shape=[1, self.pdtype.size])
-            pdparam = tf.concat([mean, mean * 0.0 + logstd], axis=1)
-            self._proba_distribution = self.pdtype.proba_distribution_from_flat(pdparam)
-            self._policy = mean"""
-
         self._setup_init()
-
-        with tf.variable_scope("model", reuse=reuse):
-            self._state_action = tf.concat([self.processed_obs, self.cast_action], axis=1)
-
-            #q_value_network: state_action as input, q_value as output
-            self._q_value_1 = tf.tanh(linear(self._state_action, 'qv_1', 16))
-            self._q_value_2 = tf.tanh(linear(self._q_value_1, 'qv_2', 4))
-            self._q_value = linear(self._q_value_2, 'qv_3', 1)
-
-            """with tf.variable_scope("qv_1"):
-                n_input_1 = self._state_action.get_shape()[1].value
-                weight_1 = tf.get_variable("w", [n_input_1, 16])
-                bias_1 = tf.get_variable("b", [16])
-                self._q_value_1 = tf.tanh(tf.matmul(self._state_action, weight_1) + bias_1)
-
-            with tf.variable_scope("qv_2"):
-                weight_2 = tf.get_variable('w', [16, 4])
-                bias_2 = tf.get_variable("b", [4])
-                self._q_value_2 = tf.tanh(tf.matmul(self._q_value_1, weight_2) + bias_2)
-
-            with tf.variable_scope("qv_3"):
-                weight_3 = tf.get_variable('w', [4, 1])
-                bias_3 = tf.get_variable("b", [1])
-                self._q_value = tf.matmul(self._q_value_2, weight_3) + bias_3"""
-
-
-            #get the gradient of action in q_value
-            self._grad_q = tf.gradients(self._q_value, self.cast_action)[0][0]
-            self._q_flat = self.q_value[:, 0]
 
     def step(self, obs, state=None, mask=None, deterministic=False):
         if deterministic:
             action, value, neglogp = self.sess.run([self.deterministic_action, self.value_flat, self.neglogp],
                                                    {self.obs_ph: obs})
         else:
-            action, q_value, neglogp, grad_q, q_value_1, q_value_2 = self.sess.run([self.action, self.q_flat, self.neglogp, self.grad_q, self._q_value_1, self._q_value_2],
+            action, value, neglogp = self.sess.run([self.action, self.value_flat, self.neglogp],
                                                    {self.obs_ph: obs})
-            """print("---------------------------")
-            print("action: ", action)
-            print("grad_q: ", grad_q)
-            print("q_value: ", q_value)"""
-        return action, q_value, self.initial_state, neglogp, grad_q
+        return action, value, self.initial_state, neglogp
 
     def proba_step(self, obs, state=None, mask=None):
         return self.sess.run(self.policy_proba, {self.obs_ph: obs})
 
     def value(self, obs, state=None, mask=None):
         return self.sess.run(self.value_flat, {self.obs_ph: obs})
+
+
+class CnnPolicy(FeedForwardPolicy):
+    """
+    Policy object that implements actor critic, using a CNN (the nature CNN)
+
+    :param sess: (TensorFlow session) The current TensorFlow session
+    :param ob_space: (Gym Space) The observation space of the environment
+    :param ac_space: (Gym Space) The action space of the environment
+    :param n_env: (int) The number of environments to run
+    :param n_steps: (int) The number of steps to run for each environment
+    :param n_batch: (int) The number of batch to run (n_envs * n_steps)
+    :param reuse: (bool) If the policy is reusable or not
+    :param _kwargs: (dict) Extra keyword arguments for the nature CNN feature extraction
+    """
+
+    def __init__(self, sess, ob_space, ac_space, n_env, n_steps, n_batch, reuse=False, **_kwargs):
+        super(CnnPolicy, self).__init__(sess, ob_space, ac_space, n_env, n_steps, n_batch, reuse,
+                                        feature_extraction="cnn", **_kwargs)
+
+
+class CnnLstmPolicy(LstmPolicy):
+    """
+    Policy object that implements actor critic, using LSTMs with a CNN feature extraction
+
+    :param sess: (TensorFlow session) The current TensorFlow session
+    :param ob_space: (Gym Space) The observation space of the environment
+    :param ac_space: (Gym Space) The action space of the environment
+    :param n_env: (int) The number of environments to run
+    :param n_steps: (int) The number of steps to run for each environment
+    :param n_batch: (int) The number of batch to run (n_envs * n_steps)
+    :param n_lstm: (int) The number of LSTM cells (for recurrent policies)
+    :param reuse: (bool) If the policy is reusable or not
+    :param kwargs: (dict) Extra keyword arguments for the nature CNN feature extraction
+    """
+
+    def __init__(self, sess, ob_space, ac_space, n_env, n_steps, n_batch, n_lstm=256, reuse=False, **_kwargs):
+        super(CnnLstmPolicy, self).__init__(sess, ob_space, ac_space, n_env, n_steps, n_batch, n_lstm, reuse,
+                                            layer_norm=False, feature_extraction="cnn", **_kwargs)
+
+
+class CnnLnLstmPolicy(LstmPolicy):
+    """
+    Policy object that implements actor critic, using a layer normalized LSTMs with a CNN feature extraction
+
+    :param sess: (TensorFlow session) The current TensorFlow session
+    :param ob_space: (Gym Space) The observation space of the environment
+    :param ac_space: (Gym Space) The action space of the environment
+    :param n_env: (int) The number of environments to run
+    :param n_steps: (int) The number of steps to run for each environment
+    :param n_batch: (int) The number of batch to run (n_envs * n_steps)
+    :param n_lstm: (int) The number of LSTM cells (for recurrent policies)
+    :param reuse: (bool) If the policy is reusable or not
+    :param kwargs: (dict) Extra keyword arguments for the nature CNN feature extraction
+    """
+
+    def __init__(self, sess, ob_space, ac_space, n_env, n_steps, n_batch, n_lstm=256, reuse=False, **_kwargs):
+        super(CnnLnLstmPolicy, self).__init__(sess, ob_space, ac_space, n_env, n_steps, n_batch, n_lstm, reuse,
+                                              layer_norm=True, feature_extraction="cnn", **_kwargs)
 
 
 class MlpPolicy(FeedForwardPolicy):
@@ -472,10 +661,54 @@ class MlpPolicy(FeedForwardPolicy):
                                         feature_extraction="mlp", **_kwargs)
 
 
+class MlpLstmPolicy(LstmPolicy):
+    """
+    Policy object that implements actor critic, using LSTMs with a MLP feature extraction
+
+    :param sess: (TensorFlow session) The current TensorFlow session
+    :param ob_space: (Gym Space) The observation space of the environment
+    :param ac_space: (Gym Space) The action space of the environment
+    :param n_env: (int) The number of environments to run
+    :param n_steps: (int) The number of steps to run for each environment
+    :param n_batch: (int) The number of batch to run (n_envs * n_steps)
+    :param n_lstm: (int) The number of LSTM cells (for recurrent policies)
+    :param reuse: (bool) If the policy is reusable or not
+    :param kwargs: (dict) Extra keyword arguments for the nature CNN feature extraction
+    """
+
+    def __init__(self, sess, ob_space, ac_space, n_env, n_steps, n_batch, n_lstm=256, reuse=False, **_kwargs):
+        super(MlpLstmPolicy, self).__init__(sess, ob_space, ac_space, n_env, n_steps, n_batch, n_lstm, reuse,
+                                            layer_norm=False, feature_extraction="mlp", **_kwargs)
+
+
+class MlpLnLstmPolicy(LstmPolicy):
+    """
+    Policy object that implements actor critic, using a layer normalized LSTMs with a MLP feature extraction
+
+    :param sess: (TensorFlow session) The current TensorFlow session
+    :param ob_space: (Gym Space) The observation space of the environment
+    :param ac_space: (Gym Space) The action space of the environment
+    :param n_env: (int) The number of environments to run
+    :param n_steps: (int) The number of steps to run for each environment
+    :param n_batch: (int) The number of batch to run (n_envs * n_steps)
+    :param n_lstm: (int) The number of LSTM cells (for recurrent policies)
+    :param reuse: (bool) If the policy is reusable or not
+    :param kwargs: (dict) Extra keyword arguments for the nature CNN feature extraction
+    """
+
+    def __init__(self, sess, ob_space, ac_space, n_env, n_steps, n_batch, n_lstm=256, reuse=False, **_kwargs):
+        super(MlpLnLstmPolicy, self).__init__(sess, ob_space, ac_space, n_env, n_steps, n_batch, n_lstm, reuse,
+                                              layer_norm=True, feature_extraction="mlp", **_kwargs)
+
 
 _policy_registry = {
     ActorCriticPolicy: {
+        "CnnPolicy": CnnPolicy,
+        "CnnLstmPolicy": CnnLstmPolicy,
+        "CnnLnLstmPolicy": CnnLnLstmPolicy,
         "MlpPolicy": MlpPolicy,
+        "MlpLstmPolicy": MlpLstmPolicy,
+        "MlpLnLstmPolicy": MlpLnLstmPolicy,
     }
 }
 

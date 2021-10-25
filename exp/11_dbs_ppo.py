@@ -6,53 +6,39 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import gym
 import gym_oscillator
 import oscillator_cpp
-from stable_baselines.common import set_global_seeds
-
-from BPG.policy_debug import MlpPolicy, FeedForwardPolicy
-#from BPG.policy import MlpPolicy
-from stable_baselines.common.vec_env import DummyVecEnv,SubprocVecEnv,VecNormalize, VecEnv
-from BPG.bpg_debug import BPG
 from BPG.ppo2 import PPO2
-from stable_baselines.common.vec_env import VecEnv
+from BPG.ppo_policy import MlpPolicy
 
-import datetime
-
-import xlwt
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 from matplotlib import pyplot as plt
 
-env_id = 'oscillator-v0'
-time_step = int(10e3)
+env_id = "oscillator-v0"
+env = gym.make(env_id)
+model = PPO2(MlpPolicy, env, learning_rate=1e-4, verbose=1)#, tensorboard_log="MLP/")
+model.learn(int(10e4))
+model.save('../result/model/ppo_dbs_10e6.pkl')
 
 
-def make_env(env_id, rank, seed=0, ):
-    """
-    Utility function for multiprocessed env.
+def plot_reward(data, name):
+    fig = plt.figure(figsize=(25, 12))
+    ax = fig.add_subplot(111)
+    ax.tick_params(labelsize=25)
+    ax.plot(data, '-', c='lightcoral', label=name)
+    ax.legend(bbox_to_anchor=(1, 1), fontsize=25)
+    ax.grid()
 
-    :param env_id: (str) the environment ID
-    :param num_env: (int) the number of environment you wish to have in subprocesses
-    :param seed: (int) the inital seed for RNG
-    :param rank: (int) index of the subprocess
-    :param s_i: (bool) reward form, only one can be true
-    """
+    ax.set_xlabel("TimeStep", fontsize=45, labelpad=15)
+    ax.set_ylabel(name, fontsize=45, labelpad=15)
+    ax.set_title(name, fontsize=55, pad=20)
 
-    def _init():
-        env = gym.make(env_id)
-        print(env.reset().shape)
-        return env
+    plt.savefig('../result/%s.png' % name)
 
-    set_global_seeds(seed)
-    return _init
+#model = model.load('../result/model/bpg_dbs_10e6.pkl')
 
-
-def gen_model():
-    num_cpu = 1
-    env = SubprocVecEnv([make_env(env_id, i) for i in range(num_cpu)])
-    model = BPG(MlpPolicy, env, verbose=1)#, tensorboard_log="MLP/", full_tensorboard_log=True)
-    model.learn(time_step)
-    return model
+env = gym.make(env_id)
+obs = env.reset()
 
 
 def test(model):
@@ -76,7 +62,7 @@ def test(model):
     infos = np.array(infos)
     s = infos[:, 3]
     a = infos[:, 2]
-    plot_sa(s, a, "0616tst")
+    plot_sa(s, a, "0830tst")
 
 
 def plot_sa(s, a, title):
@@ -99,6 +85,4 @@ def plot_sa(s, a, title):
     plt.savefig('../result/%s.png' % title)
 
 
-if __name__ == "__main__":
-    model = gen_model()
-    test(model)
+test(model)

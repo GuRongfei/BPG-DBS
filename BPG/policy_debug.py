@@ -396,41 +396,15 @@ class FeedForwardPolicy(ActorCriticPolicy):
             self._proba_distribution, self._policy, _ = \
                 self.pdtype.proba_distribution_from_latent(pi_latent, vf_latent, init_scale=0.01)
 
-            """mean = tf.tanh(linear(pi_latent, 'pi', self.pdtype.size))
-            logstd = tf.get_variable(name='pi/logstd', shape=[1, self.pdtype.size])
-            pdparam = tf.concat([mean, mean * 0.0 + logstd], axis=1)
-            self._proba_distribution = self.pdtype.proba_distribution_from_flat(pdparam)
-            self._policy = mean"""
-
         self._setup_init()
 
         with tf.variable_scope("model", reuse=reuse):
             self._state_action = tf.concat([self.processed_obs, self.cast_action], axis=1)
-
-            #q_value_network: state_action as input, q_value as output
-            self._q_value_1 = tf.tanh(linear(self._state_action, 'qv_1', 16))
-            self._q_value_2 = tf.tanh(linear(self._q_value_1, 'qv_2', 4))
-            self._q_value = linear(self._q_value_2, 'qv_3', 1)
-
-            """with tf.variable_scope("qv_1"):
-                n_input_1 = self._state_action.get_shape()[1].value
-                weight_1 = tf.get_variable("w", [n_input_1, 16])
-                bias_1 = tf.get_variable("b", [16])
-                self._q_value_1 = tf.tanh(tf.matmul(self._state_action, weight_1) + bias_1)
-
-            with tf.variable_scope("qv_2"):
-                weight_2 = tf.get_variable('w', [16, 4])
-                bias_2 = tf.get_variable("b", [4])
-                self._q_value_2 = tf.tanh(tf.matmul(self._q_value_1, weight_2) + bias_2)
-
-            with tf.variable_scope("qv_3"):
-                weight_3 = tf.get_variable('w', [4, 1])
-                bias_3 = tf.get_variable("b", [1])
-                self._q_value = tf.matmul(self._q_value_2, weight_3) + bias_3"""
-
-
-            #get the gradient of action in q_value
+            self._q_value = tf.tanh(linear(self._state_action, 'qv_1', 16))
+            self._q_value = tf.tanh(linear(self._q_value, 'qv_2', 32))
+            self._q_value = linear(self._q_value, 'qv_3', 1)
             self._grad_q = tf.gradients(self._q_value, self.cast_action)[0][0]
+            self.tst = tf.gradients(self._q_value, self.cast_action)
             self._q_flat = self.q_value[:, 0]
 
     def step(self, obs, state=None, mask=None, deterministic=False):
@@ -438,12 +412,12 @@ class FeedForwardPolicy(ActorCriticPolicy):
             action, value, neglogp = self.sess.run([self.deterministic_action, self.value_flat, self.neglogp],
                                                    {self.obs_ph: obs})
         else:
-            action, q_value, neglogp, grad_q, q_value_1, q_value_2 = self.sess.run([self.action, self.q_flat, self.neglogp, self.grad_q, self._q_value_1, self._q_value_2],
+            action, q_value, neglogp, grad_q, tst = self.sess.run([self.action, self.q_flat, self.neglogp, self.grad_q, self.tst],
                                                    {self.obs_ph: obs})
             """print("---------------------------")
-            print("action: ", action)
-            print("grad_q: ", grad_q)
-            print("q_value: ", q_value)"""
+            print("tst:", tst)
+            print("grad: ", grad_q)
+            print("action: ", action)"""
         return action, q_value, self.initial_state, neglogp, grad_q
 
     def proba_step(self, obs, state=None, mask=None):
